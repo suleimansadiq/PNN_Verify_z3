@@ -3,26 +3,23 @@
 """
 VERIFY_PATCH_POSIT8_FAKEQUANT.PY
 
-Patch‑based Z3 adversarial attack on a fake‑quant **posit‑8** MNIST network.
+Patch‑based Z3 adversarial attack on a fake‑quant **posit‑8** MNIST MLP.
 
 Parameters
 ----------
---idx N              attack the *N*‑th MNIST‑test image
---label D            first test image whose label is D (0‑9, default 9)
---patch P            patch window
-                     • single pixel:        12,17
-                     • row range, one col:  8:11,5
-                     • row & col ranges:    10:12,10:12
---eps E              test only this ε; otherwise scan ε = Δ,2Δ,…,M
+--idx N              attack the N‑th test image
+--label D            first test image with label D (0‑9, default 9)
+--patch P            patch window (12,17 or 8:11,5 or 10:12,10:12)
+--eps E              test exactly this ε; otherwise scan ε = Δ,2Δ,…,M
 --eps-step Δ         ε grid step (default 0.1)
 --eps-max M          ε grid upper bound (default 2.0)
---timeout T          solver timeout per ε in seconds (default 5 000)
+--timeout T          Z3 timeout in seconds per ε (default 5 000)
 
 Outputs
---------
-baseline logits / prediction / ASCII digit  
-for each ε: UNSAT / TIMEOUT / SAT with runtime and minimal L1  
-if SAT: ASCII diff (X = changed), adversarial logits / prediction
+-------
+baseline logits / probabilities / prediction / ASCII digit  
+for each ε: UNSAT / TIMEOUT / SAT with ε‑time and total time  
+on SAT: ASCII diff, adversarial logits / probabilities / prediction
 
 Author : Suleiman Sadiq
 """
@@ -31,33 +28,34 @@ import argparse, re, time, numpy as np, tensorflow as tf
 from tensorflow.keras.datasets import mnist
 from z3 import Optimize, Real, Bool, Or, Implies, Not, sat
 
+# nicer printing: fixed‑point and 3 decimals
+np.set_printoptions(precision=3, suppress=True)
+
 
 def ascii_digit(img):
-    palette = [('.', -0.5), (':', 0), ('+', 0.5), ('#', 1.1)]
-    return [''.join(next(s for s, t in palette if img[r, c] < t) for c in range(28))
+    pal = [('.', -0.5), (':', 0), ('+', 0.5), ('#', 1.1)]
+    return [''.join(next(s for s, t in pal if img[r, c] < t) for c in range(28))
             for r in range(28)]
 
 
 def ascii_changed(orig, adv, thr=5e-3):
-    palette = [('.', -0.5), (':', 0), ('+', 0.5), ('#', 1.1)]
+    pal = [('.', -0.5), (':', 0), ('+', 0.5), ('#', 1.1)]
     rows = []
     for r in range(28):
         row = ''
         for c in range(28):
-            if abs(adv[r, c] - orig[r, c]) > thr:
-                row += 'X'
-            else:
-                row += next(s for s, t in palette if adv[r, c] < t)
+            row += 'X' if abs(adv[r, c] - orig[r, c]) > thr else \
+                   next(s for s, t in pal if adv[r, c] < t)
         rows.append(row)
     return rows
 
 
-def z3_to_float(val):
-    s = str(val).split('+')[0].strip()
-    if s.startswith('(/'):                      # S‑expression "(/ p q)"
+def z3_to_float(v):
+    s = str(v).split('+')[0].strip()
+    if s.startswith('(/'):
         _, p, q, *_ = re.split(r'[()\s]+', s)
         return float(p) / float(q)
-    if '/' in s:                               # plain "p/q"
+    if '/' in s:
         p, q = s.split('/')
         return float(p) / float(q)
     return float(s)
@@ -114,28 +112,33 @@ def main():
     tf.reset_default_graph()
     x_ph = tf.placeholder(tf.float32, [None, 28, 28, 1])
     logits_tf, vars_tf = build_fakequant_mlp(x_ph)
+    probs_tf = tf.nn.softmax(logits_tf)
     pred_tf = tf.argmax(logits_tf, axis=1, output_type=tf.int32)
     saver = tf.train.Saver({v.name.split(':')[0]: v for v in vars_tf})
 
-    with tf.Session() as s:
-        s.run(tf.global_variables_initializer())
-        saver.restore(s, 'posit8_ultratinymlp.ckpt')
-        W1, b1, W2, b2 = s.run(vars_tf)
-        base_logits, base_pred = s.run([logits_tf, pred_tf],
-                                       {x_ph: orig[None, :, :, None]})
-    print('baseline logits:', base_logits[0])
-    print('baseline prediction:', base_pred[0])
-    for line in ascii_digit(orig):
-        print(line)
+    with tf.Session() as sess:
+        sess.run(tf.global_variables_initializer())
+        saver.restore(sess, 'posit8_ultratinymlp.ckpt')
+        W1, b1, W2, b2 = sess.run(vars_tf)
+        base_logits, base_probs, base_pred = sess.run(
+            [logits_tf, probs_tf, pred_tf], {x_ph: orig[None, :, :, None]})
+    print('baseline logits      :', base_logits[0])
+    print('baseline probabilities:', base_probs[0])
+    print('baseline prediction  :', base_pred[0])
+    for l in ascii_digit(orig):
+        print(l)
 
-    eps_values = [args.eps] if args.eps is not None else \
-                 np.arange(args.eps_step, args.eps_max + 1e-9, args.eps_step)
+    eps_vals = [args.eps] if args.eps is not None else \
+               np.arange(args.eps_step, args.eps_max + 1e-9, args.eps_step)
 
-    for eps in eps_values:
+    t_start = time.perf_counter()
+
+    for eps in eps_vals:
         opt = Optimize()
         opt.set('timeout', args.timeout * 1000)
         xs = [Real(f'x_{i}') for i in range(784)]
         abs_diffs = []
+
         for r in range(28):
             for c in range(28):
                 i = r * 28 + c
@@ -163,36 +166,37 @@ def main():
             logits.append(lv)
 
         opt.add(Or(*(logits[k] > logits[true_lbl] for k in range(10) if k != true_lbl)))
-        cost = Real('L1')
-        opt.add(cost == sum(abs_diffs))
-        h_cost = opt.minimize(cost)
+        cost = Real('L1'); opt.add(cost == sum(abs_diffs)); h_cost = opt.minimize(cost)
 
-        start = time.time()
+        t0 = time.perf_counter()
         res = opt.check()
-        elapsed = time.time() - start
+        eps_time = time.perf_counter() - t0
+        total_time = time.perf_counter() - t_start
 
         if res == sat:
             min_L1 = z3_to_float(opt.lower(h_cost))
-            print(f'\nSAT  eps={eps:.3f}  time={elapsed:.1f}s  L1={min_L1}')
-            model = opt.model()
-            adv = np.array([z3_to_float(model[xs[i]]) for i in range(784)],
+            print(f'\nSAT  eps={eps:.3f}  eps time={eps_time:.3f}s  '
+                  f'total={total_time:.1f}s  L1={min_L1}')
+            mdl = opt.model()
+            adv = np.array([z3_to_float(mdl[xs[i]]) for i in range(784)],
                            dtype=np.float32).reshape(28, 28)
-
             print('\nASCII diff (X = changed):')
             for l in ascii_changed(orig, adv):
                 print(l)
-
-            with tf.Session() as s2:
-                s2.run(tf.global_variables_initializer())
-                saver.restore(s2, 'posit8_ultratinymlp.ckpt')
-                adv_logits, adv_pred = s2.run(
-                    [logits_tf, pred_tf], {x_ph: adv[None, :, :, None]})
-            print('\nadversarial logits:', adv_logits[0])
-            print('adversarial prediction:', adv_pred[0])
+            with tf.Session() as sess2:
+                sess2.run(tf.global_variables_initializer())
+                saver.restore(sess2, 'posit8_ultratinymlp.ckpt')
+                adv_logits, adv_probs, adv_pred = sess2.run(
+                    [logits_tf, probs_tf, pred_tf],
+                    {x_ph: adv[None, :, :, None]})
+            print('\nadversarial logits      :', adv_logits[0])
+            print('adversarial probabilities:', adv_probs[0])
+            print('adversarial prediction  :', adv_pred[0])
             return
         else:
-            tag = 'TIMEOUT' if opt.reason_unknown() == 'timeout' else 'UNSAT'
-            print(f'eps={eps:.3f}  {tag} ({elapsed:.1f}s)')
+            reason = 'TIMEOUT' if opt.reason_unknown() == 'timeout' else 'UNSAT'
+            print(f'eps={eps:.3f}  {reason}  '
+                  f'(eps time={eps_time:.3f}s, total={total_time:.1f}s)')
 
     print('no adversarial patch found up to eps_max')
 
