@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 VERIFY_PATCH_POSIT32_FULLFEATURE_ASCII.PY
 
-Patch‑based Z3 attack on a tf.posit32 ultra‑tiny MNIST MLP.
-Everything matches the posit16 script (ASCII‑only):
+Patch‑based Z3 adversarial search on a tf.posit32 ultra‑tiny MNIST MLP.
 
-* command‑line flags: --idx  --label  --patch  --eps  --eps-step  --eps-max
-                     --timeout
-* ε‑grid search, minimal‑L1 objective
-* keeps scanning until the real posit32 network *actually* misclassifies
-* baseline / adversarial logits, probabilities, ASCII diff
-* crisp PNGs (images2/before.png & after.png) with red rectangle + lime X
+Features
+--------
+• baseline ASCII digit, logits, soft‑max probabilities
+• user‑controlled patch window, eps grid / single eps, per‑eps timeout
+• ε‑grid search (minimal‑L1) until the real posit32 network flips
+• ASCII diff of adversarial image
+• crisp 560×560 PNGs (images2/before.png, images2/after.png)
+  – baseline PNG has **no** rectangle  
+  – adversarial PNG shows red outline + lime “X” marks
+
+CLI flags (all optional)
+------------------------
+--idx N              attack test image N
+--label D            first test image with label D (default 9)
+--patch P            window: 12,17 | 8:11,5 | 11:13,11:13
+--eps E              test exactly ε; else scan grid
+--eps-step S         ε grid step (default 0.1)
+--eps-max M          ε grid upper bound (default 2.0)
+--timeout T          Z3 timeout per ε in seconds (default 5000)
 
 Author: Suleiman Sadiq
 """
@@ -24,9 +35,7 @@ import matplotlib.pyplot as plt
 
 np.set_printoptions(precision=3, suppress=True)
 
-# ---------------------------------------------------------------------------
-# ASCII helpers
-# ---------------------------------------------------------------------------
+# ---------- ASCII helpers --------------------------------------------------
 def ascii_digit(img):
     pal = [('.', -0.5), (':', 0), ('+', 0.5), ('#', 1.1)]
     return [''.join(next(ch for ch, t in pal if img[r, c] < t) for c in range(28))
@@ -53,22 +62,31 @@ def z3_to_float(val):
         return float(p) / float(q)
     return float(s)
 
-# ---------------------------------------------------------------------------
-# crisp PNG export (nearest‑neighbor up‑scaling)
-# ---------------------------------------------------------------------------
-def save_digit(img28, title, rect, diff_mask=None, fname='out.png'):
+# ---------- PNG export -----------------------------------------------------
+def save_digit(img28, title, rect, diff_mask=None,
+               fname='out.png', draw_rect=True):
+    """Save a 560×560 PNG of a 28×28 digit, with optional red rectangle and X."""
     r0, r1, c0, c1 = rect
     upscale, dpi = 20, 100
     big = np.kron(img28, np.ones((upscale, upscale)))
-    fig, ax = plt.subplots(figsize=(big.shape[1]/dpi, big.shape[0]/dpi), dpi=dpi)
-    ax.imshow(big, cmap='gray', vmin=-1, vmax=1, origin='upper', interpolation='none')
-    ax.add_patch(plt.Rectangle(((c0-0.5)*upscale, (r0-0.5)*upscale),
-                               (c1-c0+1)*upscale, (r1-r0+1)*upscale,
-                               fill=False, lw=2, edgecolor='red'))
+    fig, ax = plt.subplots(figsize=(big.shape[1] / dpi,
+                                    big.shape[0] / dpi),
+                           dpi=dpi)
+    ax.imshow(big, cmap='gray', vmin=-1, vmax=1,
+              origin='upper', interpolation='none')
+
+    if draw_rect:
+        ax.add_patch(plt.Rectangle((c0 * upscale, r0 * upscale),
+                                   (c1 - c0 + 1) * upscale,
+                                   (r1 - r0 + 1) * upscale,
+                                   fill=False, lw=2, edgecolor='red'))
+
     if diff_mask is not None:
         ys, xs = np.where(diff_mask)
-        ax.scatter(xs*upscale+upscale/2, ys*upscale+upscale/2,
+        ax.scatter(xs * upscale + upscale / 2,
+                   ys * upscale + upscale / 2,
                    marker='x', s=30, linewidths=1, c='lime')
+
     ax.set_xticks([]); ax.set_yticks([])
     ax.set_title(title, fontsize=10)
     fig.tight_layout(pad=0)
@@ -76,7 +94,7 @@ def save_digit(img28, title, rect, diff_mask=None, fname='out.png'):
     fig.savefig(os.path.join('images2', fname), dpi=dpi)
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
+# ---------- utility --------------------------------------------------------
 def parse_range(seg):
     if ':' in seg:
         a, b = map(int, seg.split(':'))
@@ -86,9 +104,7 @@ def parse_range(seg):
         raise ValueError('patch coords must satisfy 0 <= start <= end <= 27')
     return a, b
 
-# ---------------------------------------------------------------------------
-# network definition (posit32)
-# ---------------------------------------------------------------------------
+# ---------- network definition --------------------------------------------
 def build_ultratiny_posit32(x):
     W1 = tf.get_variable('Variable',   [784, 8],  dtype=tf.posit32)
     b1 = tf.get_variable('Variable_1', [8],       dtype=tf.posit32)
@@ -98,7 +114,7 @@ def build_ultratiny_posit32(x):
     logits = tf.matmul(fc1, W2) + b2
     return logits, (W1, b1, W2, b2)
 
-# ---------------------------------------------------------------------------
+# ---------- main -----------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--idx', type=int)
@@ -151,18 +167,16 @@ def main():
     t_script0 = time.perf_counter()
 
     for eps in eps_list:
-        opt = Optimize()
-        opt.set('timeout', args.timeout * 1000)
+        opt = Optimize(); opt.set('timeout', args.timeout * 1000)
         xs = [Real('x_%d' % i) for i in range(784)]
         abs_diffs = []
+
         for r in range(28):
             for c in range(28):
-                i = r * 28 + c
-                v0 = float(orig[r, c])
+                i = r * 28 + c; v0 = float(orig[r, c])
                 if r0 <= r <= r1 and c0 <= c <= c1:
                     opt.add(xs[i] >= v0 - eps, xs[i] <= v0 + eps)
-                    d = Real('d_%d' % i)
-                    opt.add(d >= xs[i] - v0, d >= v0 - xs[i])
+                    d = Real('d_%d' % i); opt.add(d >= xs[i] - v0, d >= v0 - xs[i])
                     abs_diffs.append(d)
                 else:
                     opt.add(xs[i] == v0)
@@ -176,19 +190,14 @@ def main():
             opt.add(Implies(rb, hj == lin), Implies(Not(rb), hj == 0))
             h.append(hj)
 
+        # output layer
         logits = []
         for d in range(10):
             lv = float(b2[d]) + sum(float(W2[j, d]) * h[j] for j in range(8))
-            z = Real('log_%d' % d)
-            opt.add(z == lv)
-            logits.append(z)
+            z = Real('log_%d' % d); opt.add(z == lv); logits.append(z)
 
-        # misclassification constraint
-        opt.add(Or(*(logits[k] > logits[true_lbl] for k in range(10)
-                     if k != true_lbl)))
-
-        cost = Real('L1')
-        opt.add(cost == sum(abs_diffs))
+        opt.add(Or(*(logits[k] > logits[true_lbl] for k in range(10) if k != true_lbl)))
+        cost = Real('L1'); opt.add(cost == sum(abs_diffs))
         h_cost = opt.minimize(cost)
 
         t0 = time.perf_counter()
@@ -201,7 +210,7 @@ def main():
             adv = np.array([z3_to_float(mdl[xs[i]]) for i in range(784)],
                            dtype=np.float32).reshape(28, 28)
 
-            # verify with posit32 network
+            # re‑check with real network
             with tf.Session() as sess2:
                 sess2.run(tf.global_variables_initializer())
                 saver.restore(sess2, CKPT)
@@ -210,8 +219,8 @@ def main():
                     {x_ph: adv[None, :, :, None]})
 
             if adv_pred[0] == true_lbl:
-                print('eps=%.3f: Z3 SAT but posit32 still predicts %d -- continuing' %
-                      (eps, true_lbl))
+                print('eps=%.3f: Z3 SAT but posit32 still predicts %d -- continuing'
+                      % (eps, true_lbl))
                 continue
 
             min_L1 = z3_to_float(opt.lower(h_cost))
@@ -219,10 +228,14 @@ def main():
                   (eps, eps_time, total_time, min_L1))
 
             diff_mask = np.abs(adv - orig) > 5e-3
+
+            print('\nASCII of adversarial image (X = changed pixel):\n')
+            for line in ascii_changed(orig, adv): print(line)
+
             save_digit(orig, 'Before (baseline)', (r0, r1, c0, c1),
-                       fname='before.png')
+                       fname='before.png', draw_rect=False)          # no rectangle
             save_digit(adv, 'After (adversarial)', (r0, r1, c0, c1),
-                       diff_mask, 'after.png')
+                       diff_mask, fname='after.png', draw_rect=True)
             print('figures saved to images2/before.png and images2/after.png')
 
             print('\nadversarial logits      :', adv_logits[0])
