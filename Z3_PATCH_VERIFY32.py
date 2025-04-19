@@ -63,7 +63,7 @@ def z3_to_float(val):
     return float(s)
 
 # ---------- PNG export -----------------------------------------------------
-def save_digit(img28, title, rect, diff_mask=None,
+def save_digit(img28, rect, diff_mask=None,
                fname='out.png', draw_rect=True):
     """Save a 560×560 PNG of a 28×28 digit, with optional red rectangle and X."""
     r0, r1, c0, c1 = rect
@@ -88,10 +88,13 @@ def save_digit(img28, title, rect, diff_mask=None,
                    marker='x', s=30, linewidths=1, c='lime')
 
     ax.set_xticks([]); ax.set_yticks([])
-    ax.set_title(title, fontsize=10)
-    fig.tight_layout(pad=0)
+
+    # keep a thin, even white border on all sides
+    fig.subplots_adjust(left=.02, right=.98, bottom=.02, top=.98)
+
     os.makedirs('images2', exist_ok=True)
-    fig.savefig(os.path.join('images2', fname), dpi=dpi)
+    fig.savefig(os.path.join('images2', fname),
+                dpi=dpi, bbox_inches='tight', pad_inches=0.02)
     plt.close(fig)
 
 # ---------- utility --------------------------------------------------------
@@ -232,10 +235,12 @@ def main():
             print('\nASCII of adversarial image (X = changed pixel):\n')
             for line in ascii_changed(orig, adv): print(line)
 
-            save_digit(orig, 'Before (baseline)', (r0, r1, c0, c1),
-                       fname='before.png', draw_rect=False)          # no rectangle
-            save_digit(adv, 'After (adversarial)', (r0, r1, c0, c1),
+            # save PNGs
+            save_digit(orig, (r0, r1, c0, c1),
+                       fname='before.png', draw_rect=False)
+            save_digit(adv, (r0, r1, c0, c1),
                        diff_mask, fname='after.png', draw_rect=True)
+
             print('figures saved to images2/before.png and images2/after.png')
 
             print('\nadversarial logits      :', adv_logits[0])
