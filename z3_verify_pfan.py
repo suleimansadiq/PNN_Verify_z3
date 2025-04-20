@@ -146,7 +146,7 @@ if mode == 'noise':
         status = 'TIMEOUT' if s.reason_unknown() == 'timeout' else res
         print(f'eps={eps:.2f}  {status}  t={time.perf_counter() - t0:.1f}s')
         if res == z3.sat:
-            print(f'Advisory changed at ε = {eps:.2f}')
+            print(f'Advisory changed at eps = {eps:.2f}')
             sat_found = True
             eps_star  = eps
             break
