@@ -71,161 +71,210 @@
 import argparse, time, sys
 import numpy as np, tensorflow as tf, z3
 
-ADV = ['COC', 'WeakLeft', 'StrongLeft', 'WeakRight', 'StrongRight']
+# --------------------------------------------------------------------- #
+#  Constants & helpers                                                  #
+# --------------------------------------------------------------------- #
+ADV   = ['COC', 'WeakLeft', 'StrongLeft', 'WeakRight', 'StrongRight']
 DTYPE = {'posit32': tf.posit32, 'posit16': tf.posit16,
          'posit8': tf.posit8,   'float32': tf.float32, 'float16': tf.float16}
-X1 = [500., 10., 5., 120., 150.]  # reference point
-ms = lambda s: int(s * 1000)
-
-# ---------------- CLI ----------------------------------------------------
-ap = argparse.ArgumentParser()
-ap.add_argument('dtype', choices=DTYPE.keys())
-g = ap.add_mutually_exclusive_group()
-g.add_argument('--weights', action='store_true')
-g.add_argument('--mono',    action='store_true')
-ap.add_argument('--eps',      type=float, default=0.10)
-ap.add_argument('--eps-step', type=float, default=0.10,
-                help='omit to use a single --eps value')
-ap.add_argument('--eps-max',  type=float, default=2.0)
-ap.add_argument('--timeout',  type=int,   default=5000)
-args = ap.parse_args()
-mode = 'weights' if args.weights else ('mono' if args.mono else 'noise')
-
-print('\nMode :', mode, '\ndtype:', args.dtype)
-
-# ---------------- load checkpoint ---------------------------------------
-ckpt = f'./{args.dtype}_pfan.ckpt'
-tf.reset_default_graph()
-with tf.Session() as s:
-    saver = tf.train.import_meta_graph(ckpt + '.meta')
-    saver.restore(s, ckpt)
-    W1, b1 = s.run(['Variable:0', 'Variable_1:0'])
-    W2, b2 = s.run(['Variable_2:0', 'Variable_3:0'])
-print('Checkpoint:', ckpt)
-
-# ---------------- baseline logits ---------------------------------------
-h = np.maximum(0, np.dot(X1, W1) + b1)
-log1 = np.dot(h, W2) + b2
-adv1 = int(np.argmax(log1))
-print('\nBaseline logits :', np.round(np.asarray(log1, dtype=float), 3))
-print('Baseline adv    :', ADV[adv1])
-
-# ---------------- helper funcs ------------------------------------------
-relu = lambda e: z3.If(e > 0, e, 0)
-def logits_sym(x):
-    h = [relu(b1[j] + sum(float(W1[i, j]) * x[i] for i in range(5)))
-         for j in range(16)]
-    return [b2[k] + sum(float(W2[j, k]) * h[j] for j in range(16))
-            for k in range(5)]
+ms    = lambda s: int(s * 1000)
 
 def z3f(v):
     if z3.is_int_value(v):      return float(v.as_long())
     if z3.is_rational_value(v): return v.numerator_as_long() / v.denominator_as_long()
     return float(str(v))
 
-# =======================================================================
-# 1) INPUT‑NOISE ROBUSTNESS  (default)
-# =======================================================================
-if mode == 'noise':
-    dr, dt, dp, dv1, dv2 = z3.Reals('dr dt dp dv1 dv2')
-    xs   = [X1[i] + d for i, d in enumerate([dr, dt, dp, dv1, dv2])]
-    log  = logits_sym(xs)
-    better = [z3.And(*[log[k] > log[j] for j in range(5) if j != k])
-              for k in range(5)]
+relu = lambda e: z3.If(e > 0, e, 0)
 
-    grid = ([args.eps] if args.eps_step is None else
-            list(np.arange(args.eps, args.eps_max + 1e-9, args.eps_step)))
+# --------------------------------------------------------------------- #
+#  Unified reason‑check helper                                          #
+# --------------------------------------------------------------------- #
+def was_ctrl_c(solver_result, solver):
+    """Return True if Z3 was interrupted by Ctrl‑C."""
+    return (solver_result == z3.unknown and
+            solver.reason_unknown() in ('interrupted', 'canceled'))
 
-    t0 = time.perf_counter()
-    sat, eps_first, eps_star, adv_adv = False, None, None, '--'
+# --------------------------------------------------------------------- #
+#  Main                                                                 #
+# --------------------------------------------------------------------- #
+def main() -> None:
 
-    for eps in grid:
-        s = z3.Optimize(); s.set(timeout=ms(args.timeout))
-        for d in [dr, dt, dp, dv1, dv2]:
-            s.add(z3.Abs(d) <= eps)
+    # ----- CLI ---------------------------------------------------------
+    ap = argparse.ArgumentParser()
+    ap.add_argument('dtype', choices=DTYPE.keys())
+    gx = ap.add_mutually_exclusive_group()
+    gx.add_argument('--weights', action='store_true')
+    gx.add_argument('--mono',    action='store_true')
+
+    # reference input
+    ap.add_argument('--rho',   type=float, default=500.)
+    ap.add_argument('--theta', type=float, default=10.)
+    ap.add_argument('--psi',   type=float, default=5.)
+    ap.add_argument('--v1',    type=float, default=120.)
+    ap.add_argument('--v2',    type=float, default=150.)
+
+    # robustness grid
+    ap.add_argument('--eps',      type=float, default=0.10)
+    ap.add_argument('--eps-step', type=float, default=0.10,
+                    help='omit to probe a single ε slice')
+    ap.add_argument('--eps-max',  type=float, default=2.0)
+    ap.add_argument('--timeout',  type=int,   default=5000)
+    args = ap.parse_args()
+
+    mode = 'weights' if args.weights else ('mono' if args.mono else 'noise')
+    X1   = [args.rho, args.theta, args.psi, args.v1, args.v2]
+
+    print('\nMode :', mode, '\ndtype:', args.dtype, '\nX1   :', X1)
+
+    # ----- load checkpoint --------------------------------------------
+    ckpt = f'./{args.dtype}_pfan.ckpt'
+    tf.reset_default_graph()
+    with tf.Session() as s:
+        saver = tf.train.import_meta_graph(ckpt + '.meta')
+        saver.restore(s, ckpt)
+        W1, b1 = s.run(['Variable:0', 'Variable_1:0'])
+        W2, b2 = s.run(['Variable_2:0', 'Variable_3:0'])
+    print('Checkpoint :', ckpt)
+
+    # ----- baseline ----------------------------------------------------
+    h0   = np.maximum(0, np.dot(X1, W1) + b1)
+    log0 = np.dot(h0, W2) + b2
+    adv0 = int(np.argmax(log0))
+    print('\nBaseline logits :', np.round(log0.astype(float), 3))
+    print('Baseline adv    :', ADV[adv0])
+
+    # ----- symbolic logits builder ------------------------------------
+    def logits_sym(x):
+        h = [relu(b1[j] + sum(float(W1[i, j]) * x[i] for i in range(5)))
+             for j in range(16)]
+        return [b2[k] + sum(float(W2[j, k]) * h[j] for j in range(16))
+                for k in range(5)]
+
+    # ===================================================================
+    # 1) ROBUSTNESS
+    # ===================================================================
+    if mode == 'noise':
+        dr, dt, dp, dv1, dv2 = z3.Reals('dr dt dp dv1 dv2')
+        xs  = [X1[i] + d for i, d in enumerate([dr,dt,dp,dv1,dv2])]
+        log = logits_sym(xs)
+
+        better = [z3.And(*[log[k] > log[j] for j in range(5) if j != k])
+                  for k in range(5)]
+
+        grid = ([args.eps] if args.eps_step is None else
+                list(np.arange(args.eps, args.eps_max + 1e-9, args.eps_step)))
+
+        t0 = time.perf_counter()
+        sat, eps_first, eps_star, adv_adv = False, None, None, '--'
+
+        for eps in grid:
+            s = z3.Optimize(); s.set(timeout=ms(args.timeout))
+            for d in [dr, dt, dp, dv1, dv2]:
+                s.add(z3.Abs(d) <= eps)
+
+            alt = z3.Int('alt')
+            s.add(z3.And(alt >= 0, alt <= 4, alt != adv0))
+            for k in range(5):
+                s.add(z3.Implies(alt == k, better[k]))
+
+            try:
+                res = s.check()
+            except KeyboardInterrupt:
+                print("\n[Ctrl‑C] Aborted by user.")
+                sys.exit(1)
+
+            if was_ctrl_c(res, s):
+                print("\n[Ctrl‑C] Solver interrupted — exiting.")
+                sys.exit(1)
+
+            status = ('TIMEOUT' if s.reason_unknown() == 'timeout' else res)
+            print(f'eps={eps:.2f}  {status}  t={time.perf_counter()-t0:.1f}s')
+
+            if res == z3.sat:
+                sat, eps_first = True, eps
+                eps_L1 = z3.Real('L1')
+                s.add(eps_L1 == sum(map(z3.Abs, [dr,dt,dp,dv1,dv2])))
+                s.minimize(eps_L1); s.check()
+                mdl      = s.model()
+                eps_star = z3f(mdl[eps_L1])
+                adv_adv  = ADV[int(mdl[alt].as_long())]
+                log_adv  = [z3f(mdl.eval(lv)) for lv in log]
+                print('\nNew logits   :', np.round(np.asarray(log_adv), 3))
+                print('Adv advisory :', adv_adv)
+                print(f'Flipped at eps = {eps_first:.2f}')
+                break
+
+        if not sat:
+            eps_first = eps_star = f'> {args.eps_max}'
+        robust005 = ('Y' if (not sat or
+                     (isinstance(eps_star, float) and eps_star > 0.05)) else 'N')
+        print('\nCSV:',
+              ','.join(map(str,
+                [f'PFAN-{args.dtype[-2:]}','ALL',ADV[adv0],
+                 adv_adv,eps_first,eps_star,robust005])))
+        return
+
+    # ===================================================================
+    # 2) WEIGHT‑TAMPERING
+    # ===================================================================
+    if mode == 'weights':
+        hid = np.maximum(0, np.dot(X1, W1) + b1)
+
+        L1  = z3.Real('L1')
+        opt = z3.Optimize(); opt.set(timeout=ms(args.timeout))
+        abs_terms, w = [], {}
+
+        for i in range(16):
+            for k in range(5):
+                v  = z3.Real(f'w_{i}_{k}'); w[(i,k)] = v
+                ad = z3.Real(f'ad_{i}_{k}')
+                opt.add(ad >= v - float(W2[i,k]))
+                opt.add(ad >= float(W2[i,k]) - v)
+                abs_terms.append(ad)
+        opt.add(L1 == sum(abs_terms))
+
+        log = [b2[k] + sum(w[(i,k)] * hid[i] for i in range(16))
+               for k in range(5)]
         alt = z3.Int('alt')
-        s.add(z3.And(alt >= 0, alt <= 4, alt != adv1))
+        opt.add(z3.And(alt >= 0, alt <= 4, alt != adv0))
         for k in range(5):
-            s.add(z3.Implies(alt == k, better[k]))
+            opt.add(z3.Implies(alt == k,
+                               z3.And(*[log[k] > log[j]
+                                        for j in range(5) if j != k])))
 
-        res = s.check()
-        status = 'TIMEOUT' if s.reason_unknown() == 'timeout' else res
-        print(f'eps={eps:.2f}  {status}  t={time.perf_counter()-t0:.1f}s')
+        print('\nMinimising ‖ΔW‖₁ …  (Ctrl‑C to abort)')
+        try:
+            opt.minimize(L1); res = opt.check()
+        except KeyboardInterrupt:
+            print("\n[Ctrl‑C] Aborted by user.")
+            sys.exit(1)
 
+        if was_ctrl_c(res, opt):
+            print("\n[Ctrl‑C] Solver interrupted — exiting.")
+            sys.exit(1)
+
+        print('Z3:', res)
         if res == z3.sat:
-            sat, eps_first = True, eps
-            # refine to minimal L1 in this slice
-            eps_L1 = z3.Real('L1')
-            s.add(eps_L1 == z3.Abs(dr)+z3.Abs(dt)+z3.Abs(dp)+z3.Abs(dv1)+z3.Abs(dv2))
-            s.minimize(eps_L1); s.check()
-            mdl = s.model()
-            eps_star = z3f(mdl[eps_L1])
-            adv_adv  = ADV[int(mdl[alt].as_long())]
+            mdl   = opt.model()
+            L1min = z3f(mdl[L1])
+            delta = [z3f(mdl[z3.Real(f'ad_{i}_{k}')])
+                     for i in range(16) for k in range(5)]
+            print('L1* = %.6f  max=%.4f  mean=%.4f  rel=%.2f %%'
+                  % (L1min, max(delta), sum(delta)/len(delta),
+                     100.*L1min/np.abs(W2).sum()))
+        return
 
-            log_adv = [z3f(mdl.eval(lv)) for lv in log]
-            print('\nNew logits :', np.round(np.asarray(log_adv, dtype=float), 3))
-            print('Adv advisory :', adv_adv)
-            print(f'Advisory changed at eps = {eps_first:.2f}')
-            break
-
-    if not sat:
-        eps_first = f'> {args.eps_max}'
-        eps_star  = f'> {args.eps_max}'
-
-    robust005 = 'Y' if (not sat or (isinstance(eps_star, float) and eps_star > 0.05)) else 'N'
-
-    # -------- CSV summary line -----------------------------------------
-    csv_line = [f'PFAN-{args.dtype[-2:]}', 'ALL', ADV[adv1],
-                adv_adv, eps_first, eps_star, robust005]
-    print('\nCSV:', ','.join(map(str, csv_line)))
-    sys.exit(0)
-
-# =======================================================================
-# 2) WEIGHT‑TAMPERING ATTACK  (--weights)
-# =======================================================================
-if mode == 'weights':
-    hid = np.maximum(0, np.dot(X1, W1) + b1)
-    L1 = z3.Real('L1'); abs_terms = []; w = {}
-    opt = z3.Optimize(); opt.set(timeout=ms(args.timeout))
-
-    for i in range(8):
-        for k in range(5):
-            v  = z3.Real(f'w_{i}_{k}'); w[(i,k)] = v
-            ad = z3.Real(f'ad_{i}_{k}')
-            opt.add(ad >= v - float(W2[i,k]))
-            opt.add(ad >= float(W2[i,k]) - v)
-            abs_terms.append(ad)
-    opt.add(L1 == sum(abs_terms))
-
-    log = [b2[k] + sum(w[(i,k)] * hid[i] for i in range(8)) for k in range(5)]
-    alt = z3.Int('alt')
-    opt.add(z3.And(alt >= 0, alt <= 4, alt != adv1))
-    for k in range(5):
-        opt.add(z3.Implies(alt == k,
-                           z3.And(*[log[k] > log[j] for j in range(5) if j != k])))
-
-    print('\nMinimising L1 on W2 …')
-    opt.minimize(L1); res = opt.check()
-    print('Z3:', res)
-    if res == z3.sat:
-        mdl   = opt.model()
-        L1min = z3f(mdl[L1])
-        delta = [z3f(mdl[z3.Real(f'ad_{i}_{k}')]) for i in range(8) for k in range(5)]
-        print('L1* = %.6f  max=%.4f  mean=%.4f  rel=%.2f %%'
-              % (L1min, max(delta), sum(delta)/len(delta),
-                 100.*L1min/np.abs(W2).sum()))
-    sys.exit(0)
-
-# =======================================================================
-# 3) ADVISORY MONOTONICITY  (--mono)
-# =======================================================================
-if mode == 'mono':
+    # ===================================================================
+    # 3) MONOTONICITY
+    # ===================================================================
     d_rho, d_psi = z3.Reals('d_rho d_psi')
     rho1, psi1   = X1[0], X1[2]
     rho2, psi2   = rho1 + d_rho, psi1 + d_psi
 
-    xs1 = [rho1, X1[1], psi1, X1[3], X1[4]]
-    xs2 = [rho2, X1[1], psi2, X1[3], X1[4]]
+    xs1, xs2 = (
+        [rho1, X1[1], psi1, X1[3], X1[4]],
+        [rho2, X1[1], psi2, X1[3], X1[4]]
+    )
     l1, l2 = logits_sym(xs1), logits_sym(xs2)
 
     opt = z3.Optimize(); opt.set(timeout=ms(args.timeout))
@@ -234,7 +283,8 @@ if mode == 'mono':
         opt.add(idx >= 0, idx <= 4)
         for k in range(5):
             opt.add(z3.Implies(idx == k,
-                               z3.And(*[lv[k] > lv[j] for j in range(5) if j != k])))
+                               z3.And(*[lv[k] > lv[j]
+                                        for j in range(5) if j != k])))
         return idx
 
     a1 = argmax_sym(l1, 'a1')
@@ -245,11 +295,30 @@ if mode == 'mono':
                        z3.If(z3.Or(idx == 1, idx == 3), 1, 2))
     opt.add(rank(a2) < rank(a1))
 
-    print('\nChecking monotonicity …')
-    res = opt.check()
+    print('\nChecking monotonicity …  (Ctrl‑C to abort)')
+    try:
+        res = opt.check()
+    except KeyboardInterrupt:
+        print("\n[Ctrl‑C] Aborted by user.")
+        sys.exit(1)
+
+    if was_ctrl_c(res, opt):
+        print("\n[Ctrl‑C] Solver interrupted — exiting.")
+        sys.exit(1)
+
     print('Z3:', res)
     if res == z3.sat:
         m = opt.model()
-        print('Violation: rho2', z3f(m[rho2]),
-              'psi2', z3f(m[psi2]),
-              'adv',  m[a1].as_long(), '->', m[a2].as_long())
+        print('Violation:',
+              'rho2', z3f(m[rho2]), 'psi2', z3f(m[psi2]),
+              'adv', m[a1].as_long(), '→', m[a2].as_long())
+
+# --------------------------------------------------------------------- #
+#  Entry point                                                          #
+# --------------------------------------------------------------------- #
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[Ctrl‑C] Aborted by user.")
+        sys.exit(1)
