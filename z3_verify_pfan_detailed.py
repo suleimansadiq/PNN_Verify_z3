@@ -119,6 +119,9 @@ ap.add_argument("--eps", type=float, default=0.10)
 ap.add_argument("--eps-step", type=float, default=0.10)
 ap.add_argument("--eps-max", type=float, default=2.0)
 
+ap.add_argument('--rho-drop', type=float, default=500.0,
+                help='maximum allowed decrease in rho (m) when checking monotonicity')
+
 ap.add_argument("--block", type=float, default=0.10)
 ap.add_argument("--limit", type=int)
 ap.add_argument("--timeout", type=float, default=30.0)
@@ -521,52 +524,78 @@ if mode == "weights":
 # ------------------------------------------------------------------
 
 
-# ------------------------------------------------------------------
-# 8)  MONOTONICITY  (decreasing rho, non‑increasing |psi|)
-# ------------------------------------------------------------------
+# =========================================================================
+# 8) MONOTONICITY  (rho must drop by at most --rho-drop metres,
+#                   |psi2| must not exceed |psi1|)
+# =========================================================================
 if mode == "mono":
     X0 = [args.rho, args.theta, args.psi, args.v1, args.v2]
 
     # symbolic deltas
     d_rho, d_psi = z3.Reals("d_rho d_psi")
-    rho1, psi1   = X0[0], X0[2]              # numeric
+    rho1, psi1   = X0[0], X0[2]
     rho2, psi2   = rho1 + d_rho, psi1 + d_psi
 
-    # two inputs that differ only in (rho,psi)
-    xs1 = [rho1, X0[1], psi1, X0[3], X0[4]]
-    xs2 = [rho2, X0[1], psi2, X0[3], X0[4]]
-    l1  = logits_sym(xs1, W1, b1, W2, b2)
-    l2  = logits_sym(xs2, W1, b1, W2, b2)
+    xs1  = [rho1, X0[1], psi1, X0[3], X0[4]]
+    xs2  = [rho2, X0[1], psi2, X0[3], X0[4]]
+    l1   = logits_sym(xs1, W1, b1, W2, b2)
+    l2   = logits_sym(xs2, W1, b1, W2, b2)
 
-    s   = z3.Solver()
+    s    = z3.Solver()
     s.set("timeout", int(args.timeout * 1000))
 
-    a1  = argmax_sym(l1, s, "a1")            # advisory at (rho1,psi1)
-    a2  = argmax_sym(l2, s, "a2")            # advisory at (rho2,psi2)
+    a1   = argmax_sym(l1, s, "a1")
+    a2   = argmax_sym(l2, s, "a2")
 
-    # ranking: COC = 0  ;  Weak = 1  ;  Strong = 2
+    # advisory rank: 0 = COC, 1 = weak, 2 = strong
     rank = lambda idx: z3.If(idx == 0, 0,
                        z3.If(z3.Or(idx == 1, idx == 3), 1, 2))
 
-    # monotonicity property
-    s.add(rho2 < rho1,                     # intruder is closer
-          z3.Abs(psi2) <= abs(psi1),       # absolute heading error no larger
-          rank(a2) < rank(a1))             # advisory becomes strictly "stronger"
+    # constraints
+    s.add(d_rho < 0)                                 # rho2 strictly smaller
+    s.add(z3.Abs(d_rho) <= args.rho_drop)            # bound on decrease
+    s.add(z3.Abs(psi2) <= abs(psi1))                 # |psi2| not larger
+    s.add(rank(a2) < rank(a1))                       # advisory must improve
 
-    t0  = time.perf_counter()
-    res = s.check()
-    dt  = time.perf_counter() - t0
-    total = time.perf_counter() - script_start
-
-    print("\nChecking monotonicity ...")
-    print("Z3 %-7s  (solver %.3fs, total %.1fs)" % (str(res), dt, total))
+    t0   = time.perf_counter()
+    res  = s.check()
+    wall = time.perf_counter() - t0
+    print("\nMONO", str(res), "  (wall %.3fs)" % wall)
 
     if res == z3.sat:
-        m         = s.model()
-        rho2_val  = z3f(m.evaluate(rho2))
-        psi2_val  = z3f(m.evaluate(psi2))
-        adv_from  = m[a1].as_long()
-        adv_to    = m[a2].as_long()
-        print("Violation at rho2 %.2f  psi2 %.2f   adv %d -> %d"
-              % (rho2_val, psi2_val, adv_from, adv_to))
+        m          = s.model()
+        rho2_val   = z3f(m.eval(rho2,  model_completion=True))
+        psi2_val   = z3f(m.eval(psi2,  model_completion=True))
+        adv_from   = m[a1].as_long()
+        adv_to     = m[a2].as_long()
+
+        print("  rho  %.0f -> %.0f" % (rho1, rho2_val))
+        print("  psi  %.1f -> %.1f" % (psi1, psi2_val))
+        print("  adv  %s -> %s"      % (ADV[adv_from], ADV[adv_to]))
+        print("  time %.3fs" % wall)
+
+        # CSV line
+        csv_row = [
+            "PFAN-" + args.dtype[-2:],
+            "VIOL",
+            "%s->%s"      % (ADV[adv_from], ADV[adv_to]),
+            "%.0f->%.0f"  % (rho1, rho2_val),
+            "%.1f->%.1f"  % (psi1, psi2_val),
+            "%.2f"        % wall,
+        ]
+        print("\nCSV:", ",".join(csv_row))
+        with open("mono_log.csv", "a", newline="") as f:
+            csv.writer(f).writerow(csv_row)
+    else:
+        print("  no violation found within given bounds / time limit")
+        csv_row = [
+            "PFAN-" + args.dtype[-2:],
+            "HOLDS",
+            "--", "--", "--",
+            "%.2f" % wall,
+        ]
+        print("\nCSV:", ",".join(csv_row))
+        with open("mono_log.csv", "a", newline="") as f:
+            csv.writer(f).writerow(csv_row)
+
     sys.exit(0)
