@@ -423,35 +423,39 @@ if mode == "noise":
     sys.exit(0)
 
 # ------------------------------------------------------------------
-# 7) WEIGHT‑TAMPERING
+# 7)  WEIGHT‑TAMPERING  (minimise layer‑2 L1 shift)
 # ------------------------------------------------------------------
-if mode == 'weights':
+if mode == "weights":
     X0 = [args.rho, args.theta, args.psi, args.v1, args.v2]
 
-    hid_num  = np.maximum(0, np.dot(X0, W1) + b1)
-    logits_0 = np.dot(hid_num, W2) + b2
-    adv_orig = int(np.argmax(logits_0))
+    # ------------ baseline forward pass (all numeric) --------------
+    hid_num   = np.maximum(0, np.dot(X0, W1) + b1)
+    logits_0  = np.dot(hid_num, W2) + b2
+    adv_orig  = int(np.argmax(logits_0))        # original advisory
 
-    hid = hid_num                     # reused below
+    # ------------ build Z3 optimisation problem --------------------
+    hid = hid_num                                # reuse numeric vector
+    newW, abs_terms = {}, []
 
-    L1  = z3.Real('L1')
-    opt = z3.Optimize()
-    opt.set('timeout', int(args.timeout * 1000))
-
-    abs_terms, newW = [], {}
     for i in range(16):
         for k in range(5):
-            v = z3.Real('w_%d_%d' % (i, k)); newW[(i, k)] = v
-            a = z3.Real('a_%d_%d' % (i, k))
-            opt.add(a >= v - float(W2[i, k]),
-                    a >= float(W2[i, k]) - v)
-            abs_terms.append(a)
+            w_var = z3.Real(f"w_{i}_{k}")
+            newW[(i, k)] = w_var
+            a = z3.Real(f"a_{i}_{k}")            # |Delta W|
+            orig = float(W2[i, k])
+            opt_cond = [a >= w_var - orig, a >= orig - w_var]
+            abs_terms.extend(opt_cond)
+
+    L1 = z3.Real("L1")
+    opt = z3.Optimize()
+    opt.set("timeout", int(args.timeout * 1000))
     opt.add(L1 == sum(abs_terms))
 
-    log = [b2[k] + sum(newW[(i, k)] * hid[i] for i in range(16))
-           for k in range(5)]
+    # network logits with tampered weights
+    log = [ b2[k] + sum( newW[(i, k)] * hid[i] for i in range(16) )
+            for k in range(5) ]
 
-    alt = z3.Int('alt')
+    alt = z3.Int("alt")
     opt.add(z3.And(alt >= 0, alt <= 4, alt != adv_orig))
     for k in range(5):
         opt.add(z3.Implies(alt == k,
@@ -459,14 +463,56 @@ if mode == 'weights':
 
     opt.minimize(L1)
 
-    print('\nMinimising L1 ...')
-    t0 = time.perf_counter()            # start wall‑clock
+    # -------------------- solve ------------------------------------
+    t0 = time.perf_counter()
+    print("\nMinimising L1 ...")
     res = opt.check()
-    elapsed = time.perf_counter() - t0  # wall‑clock seconds
-    print('Z3:', res, '  wall time = %.2fs' % elapsed)
+    wall = time.perf_counter() - t0
+    print("Z3:", res, "  wall time = %.2fs" % wall)
+
     if res == z3.sat:
-        print('L1* =', z3f(opt.model()[L1]))
+        mdl      = opt.model()
+        L1_star  = z3f(mdl[L1])
+
+        # materialise the new W2 to compute extra stats
+        W2_new = np.zeros_like(W2, dtype=float)
+        for i in range(16):
+            for k in range(5):
+                W2_new[i, k] = z3f(mdl[newW[(i, k)]])
+
+        dW        = W2_new - W2
+        max_dw    = float(np.max(np.abs(dW)))
+        mean_dw   = float(np.mean(np.abs(dW)))
+        rel_pct   = 100.0 * L1_star / float(np.sum(np.abs(W2)))
+
+        adv_flip  = ADV[int(mdl[alt].as_long())]
+
+        print("\nBaseline adv :", ADV[adv_orig])
+        print("Flipped  adv :", adv_flip)
+        print("   L1* shift :", L1_star)
+        print("   max |dW|  :", max_dw)
+        print("   mean|dW|  :", mean_dw)
+        print("   rel shift : %.3f %% of total |W2|" % rel_pct)
+        print("   time (s)  :", round(wall, 3))
+
+        # CSV line (append / create)
+        csv_line = [
+            "PFAN-" + args.dtype[-2:],
+            "W_ATTACK",
+            ADV[adv_orig],
+            adv_flip,
+            "%.6f" % L1_star,
+            "%.6f" % max_dw,
+            "%.6f" % mean_dw,
+            "%.3f"  % rel_pct,
+            "%.2f"  % wall,
+        ]
+        with open("weight_attack_log.csv", "a", newline="") as f:
+            csv.writer(f).writerow(csv_line)
+        print("\nCSV:", ",".join(csv_line))
+
     sys.exit(0)
+
 
 # =========================================================================
 # 8) MONOTONICITY
