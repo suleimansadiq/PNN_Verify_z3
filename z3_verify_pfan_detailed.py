@@ -1,24 +1,85 @@
 #!/usr/bin/env python3
-# ======================================================================
-#  z3_verify_pfan.py   --   PFAN‑1 SMT safety / robustness checker
-#  (ASCII‑only edition, April 2025)
+# =========================================================================
+#  PFAN‑1 VERIFICATION SCRIPT (ASCII‑only)
+#  ------------------------------------------------------------------------
+#  File         :  z3_verify_pfan.py
+#  Author       :  Suleiman Sadiq
+#  Revision     :  April 2025 demonstration version
 #
-#  Numeric types  :  posit32 / posit16 / posit8 / float32 / float16
+#  Purpose      :  Performs SMT‑based safety / robustness checks on the
+#                  “PFAN‑1” 5‑16‑5 network that emulates ACAS advisories.
 #
-#  Modes
-#    default            epsilon‑grid noise robustness
-#    --weights          weight‑tampering  (min ||Delta W2||_1)
-#    --mono             monotonicity check
-#    --zones            per‑zone counter‑example search
-#         --block R     axis‑aligned blocker radius   (default 0.10)
-#         --limit N     cap witnesses per zone        (omit = inf)
-#         --timeout S   budget per zone in seconds    (default 30)
-#         --first-only  stop a zone after first CE
+#  ------------------------------------------------------------------------
+#  NUMERIC TYPES / CHECKPOINTS
+#  ------------------------------------------------------------------------
+#    posit32   -> posit32_pfan.ckpt
+#    posit16   -> posit16_pfan.ckpt
+#    posit8    -> posit8_pfan.ckpt
+#    float32   -> float32_pfan.ckpt
+#    float16   -> float16_pfan.ckpt
+#  (All .ckpt files must reside in the current working directory.)
 #
-#  Output files
-#     zones  ->  zones_stats_<dtype>.csv
-#     noise  ->  robustness_log.csv   (append‑only)
-# ======================================================================
+#  ------------------------------------------------------------------------
+#  MODES (choose exactly one)
+#  ------------------------------------------------------------------------
+#    default            : epsilon‑grid input‑noise robustness
+#    --zones            : per‑zone counter‑example search
+#    --weights          : weight‑tampering (minimise L1 shift on final layer)
+#    --mono             : advisory‑monotonicity check
+#
+#  ------------------------------------------------------------------------
+#  COMMON OPTIONAL FLAGS
+#  ------------------------------------------------------------------------
+#    --timeout  S       : wall‑clock budget in seconds (default 30)
+#
+#  ------------------------------------------------------------------------
+#  NOISE MODE FLAGS
+#  ------------------------------------------------------------------------
+#    --rho   R          : nominal rho        (m)
+#    --theta T          : nominal theta      (deg)
+#    --psi   P          : nominal psi        (deg)
+#    --v1    V1         : ownship speed      (m/s – may be negative)
+#    --v2    V2         : intruder speed     (m/s – may be negative)
+#    --eps      E       : starting epsilon   (default 0.10)
+#    --eps-step D       : grid step          (default 0.10)
+#    --eps-max  M       : ceiling            (default 2.0)
+#
+#  Output (noise mode)
+#    • Per‑grid‑point line:  eps=E  (un)sat/unknown  time
+#    • On first SAT:        "First flip: AAA -> BBB at eps = EF"
+#    • Final CSV line       appended to robustness_log.csv
+#
+#  ------------------------------------------------------------------------
+#  ZONES MODE FLAGS
+#  ------------------------------------------------------------------------
+#    --block   R        : axis‑aligned blocker radius (default 0.10)
+#    --limit   N        : max witnesses per zone (omit = unlimited)
+#    --timeout S        : budget per zone in seconds (default 30)
+#    --first-only       : stop a zone after first witness
+#
+#  Output (zones mode)
+#    • One "FAIL:" line per counter‑example (rho,theta,psi,v1,v2)
+#    • Aligned ASCII summary table for all 5 zones
+#    • zones_stats_<dtype>.csv written with the same data
+#
+#  ------------------------------------------------------------------------
+#  QUICK EXAMPLES
+#  ------------------------------------------------------------------------
+#    1) 10‑second zone scan:
+#         python3 z3_verify_pfan.py posit16 --zones --timeout 10
+#
+#    2) Deeper scan (block 50 m, 100‑s budget):
+#         python3 z3_verify_pfan.py posit16 --zones --block 50 --timeout 100
+#
+#    3) Local robustness sweep around a Zone‑3 encounter:
+#         python3 z3_verify_pfan.py posit16 --rho 1000 --theta 90 --psi 60 \
+#                  --v1 0 --v2 0 --eps 1.0 --eps-step 1.0 --eps-max 50
+#
+#  ------------------------------------------------------------------------
+#  DEPENDENCIES
+#  ------------------------------------------------------------------------
+#    Python 3.6+ , TensorFlow 1.x CPU,  z3‑solver 4.8+,  NumPy ≥ 1.16
+# =========================================================================
 
 import argparse, sys, time, csv
 from collections import Counter
