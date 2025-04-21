@@ -423,95 +423,102 @@ if mode == "noise":
     sys.exit(0)
 
 # ------------------------------------------------------------------
-# 7)  WEIGHT‑TAMPERING  (minimise layer‑2 L1 shift)
+# --- weight‑tampering begin --------------------------------------
 # ------------------------------------------------------------------
 if mode == "weights":
     X0 = [args.rho, args.theta, args.psi, args.v1, args.v2]
 
-    # ------------ baseline forward pass (all numeric) --------------
-    hid_num   = np.maximum(0, np.dot(X0, W1) + b1)
-    logits_0  = np.dot(hid_num, W2) + b2
-    adv_orig  = int(np.argmax(logits_0))        # original advisory
+    # 1) baseline numeric output
+    hid_num  = np.maximum(0, np.dot(X0, W1) + b1)
+    logits_0 = np.dot(hid_num, W2) + b2
+    adv_orig = int(np.argmax(logits_0))            # original advisory
 
-    # ------------ build Z3 optimisation problem --------------------
-    hid = hid_num                                # reuse numeric vector
+    hid = hid_num.astype(float)                    # numeric 16‑vector
+
+    # 2) optimisation variables
+    opt  = z3.Optimize()
+    opt.set("timeout", int(args.timeout * 1000))
+
     newW, abs_terms = {}, []
-
     for i in range(16):
         for k in range(5):
-            w_var = z3.Real(f"w_{i}_{k}")
-            newW[(i, k)] = w_var
-            a = z3.Real(f"a_{i}_{k}")            # |Delta W|
+            v = z3.Real(f"w_{i}_{k}")              # tampered weight
+            newW[(i, k)] = v
+            a = z3.Real(f"a_{i}_{k}")              # |Δw|
             orig = float(W2[i, k])
-            opt_cond = [a >= w_var - orig, a >= orig - w_var]
-            abs_terms.extend(opt_cond)
+            opt.add(a >= v - orig, a >= orig - v)
+            abs_terms.append(a)
 
     L1 = z3.Real("L1")
-    opt = z3.Optimize()
-    opt.set("timeout", int(args.timeout * 1000))
-    opt.add(L1 == sum(abs_terms))
+    opt.add(L1 == z3.Sum(*abs_terms))
+    h_L1 = opt.minimize(L1)
 
-    # network logits with tampered weights
-    log = [ b2[k] + sum( newW[(i, k)] * hid[i] for i in range(16) )
-            for k in range(5) ]
-
+    # 3) logits with new weights
+    log = [
+        b2[k] + z3.Sum(*(newW[(i, k)] * hid[i] for i in range(16)))
+        for k in range(5)
+    ]
     alt = z3.Int("alt")
     opt.add(z3.And(alt >= 0, alt <= 4, alt != adv_orig))
     for k in range(5):
-        opt.add(z3.Implies(alt == k,
-                           z3.And(*[log[k] > log[j] for j in range(5) if j != k])))
+        opt.add(
+            z3.Implies(alt == k,
+                       z3.And(*[log[k] > log[j] for j in range(5) if j != k]))
+        )
 
-    opt.minimize(L1)
-
-    # -------------------- solve ------------------------------------
-    t0 = time.perf_counter()
     print("\nMinimising L1 ...")
+    t0 = time.perf_counter()
     res = opt.check()
-    wall = time.perf_counter() - t0
-    print("Z3:", res, "  wall time = %.2fs" % wall)
+    t1 = time.perf_counter()
+    print("Z3:", res, "  wall time = %.2fs" % (t1 - t0))
 
     if res == z3.sat:
         mdl      = opt.model()
-        L1_star  = z3f(mdl[L1])
+        L1_star  = z3f(mdl.eval(L1))
 
-        # materialise the new W2 to compute extra stats
-        W2_new = np.zeros_like(W2, dtype=float)
-        for i in range(16):
-            for k in range(5):
-                W2_new[i, k] = z3f(mdl[newW[(i, k)]])
+        dW = np.array(
+            [[z3f(mdl[newW[(i, k)]]) - float(W2[i, k]) for k in range(5)]
+             for i in range(16)],
+            dtype=np.float64,
+        )
 
-        dW        = W2_new - W2
-        max_dw    = float(np.max(np.abs(dW)))
-        mean_dw   = float(np.mean(np.abs(dW)))
-        rel_pct   = 100.0 * L1_star / float(np.sum(np.abs(W2)))
+        max_dw  = float(np.max(np.abs(dW)))
+        mean_dw = float(np.mean(np.abs(dW)))
 
-        adv_flip  = ADV[int(mdl[alt].as_long())]
+        total_w2_norm = float(np.sum(np.abs(W2.astype(np.float64))))
+        rel_pct = 0.0 if total_w2_norm == 0 else 100.0 * L1_star / total_w2_norm
 
-        print("\nBaseline adv :", ADV[adv_orig])
-        print("Flipped  adv :", adv_flip)
+        flipped_adv = ADV[int(mdl[alt].as_long())]
+
+        print("Baseline adv :", ADV[adv_orig])
+        print("Flipped  adv :", flipped_adv)
         print("   L1* shift :", L1_star)
         print("   max |dW|  :", max_dw)
         print("   mean|dW|  :", mean_dw)
         print("   rel shift : %.3f %% of total |W2|" % rel_pct)
-        print("   time (s)  :", round(wall, 3))
+        print("   time (s)  : %.3f" % (t1 - t0))
 
-        # CSV line (append / create)
-        csv_line = [
-            "PFAN-" + args.dtype[-2:],
-            "W_ATTACK",
-            ADV[adv_orig],
-            adv_flip,
-            "%.6f" % L1_star,
-            "%.6f" % max_dw,
-            "%.6f" % mean_dw,
-            "%.3f"  % rel_pct,
-            "%.2f"  % wall,
+        csv_row = [
+            "PFAN-" + args.dtype[-2:],    # model
+            "W_ATTACK",                   # mode tag
+            ADV[adv_orig],                # original label
+            flipped_adv,                  # flipped label
+            "%.6f" % L1_star,             # L1*
+            "%.6f" % max_dw,              # max |ΔW|
+            "%.6f" % mean_dw,             # mean |ΔW|
+            "%.3f"  % rel_pct,            # relative %
+            "%.2f"  % (t1 - t0)           # time
         ]
-        with open("weight_attack_log.csv", "a", newline="") as f:
-            csv.writer(f).writerow(csv_line)
-        print("\nCSV:", ",".join(csv_line))
+        print("\nCSV:", ",".join(csv_row))
+        with open("weights_attack_log.csv", "a", newline="") as f:
+            csv.writer(f).writerow(csv_row)
+    else:
+        print("No advisory flip found within the given timeout.")
 
     sys.exit(0)
+# ------------------------------------------------------------------
+# --- weight‑tampering end ----------------------------------------
+# ------------------------------------------------------------------
 
 
 # =========================================================================
