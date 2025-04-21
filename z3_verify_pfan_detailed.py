@@ -521,39 +521,52 @@ if mode == "weights":
 # ------------------------------------------------------------------
 
 
-# =========================================================================
-# 8) MONOTONICITY
-# =========================================================================
+# ------------------------------------------------------------------
+# 8)  MONOTONICITY  (decreasing rho, non‑increasing |psi|)
+# ------------------------------------------------------------------
 if mode == "mono":
     X0 = [args.rho, args.theta, args.psi, args.v1, args.v2]
+
+    # symbolic deltas
     d_rho, d_psi = z3.Reals("d_rho d_psi")
-    rho1, psi1 = X0[0], X0[2]
-    rho2, psi2 = rho1 + d_rho, psi1 + d_psi
+    rho1, psi1   = X0[0], X0[2]              # numeric
+    rho2, psi2   = rho1 + d_rho, psi1 + d_psi
+
+    # two inputs that differ only in (rho,psi)
     xs1 = [rho1, X0[1], psi1, X0[3], X0[4]]
     xs2 = [rho2, X0[1], psi2, X0[3], X0[4]]
-    l1 = logits_sym(xs1, W1, b1, W2, b2)
-    l2 = logits_sym(xs2, W1, b1, W2, b2)
+    l1  = logits_sym(xs1, W1, b1, W2, b2)
+    l2  = logits_sym(xs2, W1, b1, W2, b2)
 
-    s = z3.Solver()
+    s   = z3.Solver()
     s.set("timeout", int(args.timeout * 1000))
-    a1 = argmax_sym(l1, s, "a1")
-    a2 = argmax_sym(l2, s, "a2")
-    rank = lambda idx: z3.If(
-        idx == 0, 0, z3.If(z3.Or(idx == 1, idx == 3), 1, 2)
-    )
-    s.add(rho2 < rho1, z3.Abs(psi2) <= abs(psi1), rank(a2) < rank(a1))
 
-    t0 = time.perf_counter()
+    a1  = argmax_sym(l1, s, "a1")            # advisory at (rho1,psi1)
+    a2  = argmax_sym(l2, s, "a2")            # advisory at (rho2,psi2)
+
+    # ranking: COC = 0  ;  Weak = 1  ;  Strong = 2
+    rank = lambda idx: z3.If(idx == 0, 0,
+                       z3.If(z3.Or(idx == 1, idx == 3), 1, 2))
+
+    # monotonicity property
+    s.add(rho2 < rho1,                     # intruder is closer
+          z3.Abs(psi2) <= abs(psi1),       # absolute heading error no larger
+          rank(a2) < rank(a1))             # advisory becomes strictly "stronger"
+
+    t0  = time.perf_counter()
     res = s.check()
-    eps_time = time.perf_counter() - t0
-    total_time = time.perf_counter() - script_start
-    print("\nChecking monotonicity ...")
-    print("Z3 %-7s  (eps time=%.3fs, total=%.1fs)" % (str(res), eps_time, total_time))
-    if res == z3.sat:
-        m = s.model()
-        print(
-            "Violation at rho2 %.2f psi2 %.2f  adv %d -> %d"
-            % (z3f(m[rho2]), z3f(m[psi2]), m[a1].as_long(), m[a2].as_long())
-        )
-    sys.exit(0)
+    dt  = time.perf_counter() - t0
+    total = time.perf_counter() - script_start
 
+    print("\nChecking monotonicity ...")
+    print("Z3 %-7s  (solver %.3fs, total %.1fs)" % (str(res), dt, total))
+
+    if res == z3.sat:
+        m         = s.model()
+        rho2_val  = z3f(m.evaluate(rho2))
+        psi2_val  = z3f(m.evaluate(psi2))
+        adv_from  = m[a1].as_long()
+        adv_to    = m[a2].as_long()
+        print("Violation at rho2 %.2f  psi2 %.2f   adv %d -> %d"
+              % (rho2_val, psi2_val, adv_from, adv_to))
+    sys.exit(0)
