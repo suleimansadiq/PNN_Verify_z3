@@ -1,85 +1,13 @@
 #!/usr/bin/env python3
 # =========================================================================
-#  PFAN‑1 VERIFICATION SCRIPT (ASCII‑only)
+#  PFAN-1 VERIFICATION SCRIPT (ASCII only)
 #  ------------------------------------------------------------------------
-#  File         :  z3_verify_pfan.py
-#  Author       :  Suleiman Sadiq
-#  Revision     :  April 2025 demonstration version
-#
-#  Purpose      :  Performs SMT‑based safety / robustness checks on the
-#                  “PFAN‑1” 5‑16‑5 network that emulates ACAS advisories.
-#
-#  ------------------------------------------------------------------------
-#  NUMERIC TYPES / CHECKPOINTS
-#  ------------------------------------------------------------------------
-#    posit32   -> posit32_pfan.ckpt
-#    posit16   -> posit16_pfan.ckpt
-#    posit8    -> posit8_pfan.ckpt
-#    float32   -> float32_pfan.ckpt
-#    float16   -> float16_pfan.ckpt
-#  (All .ckpt files must reside in the current working directory.)
-#
-#  ------------------------------------------------------------------------
-#  MODES (choose exactly one)
-#  ------------------------------------------------------------------------
-#    default            : epsilon‑grid input‑noise robustness
-#    --zones            : per‑zone counter‑example search
-#    --weights          : weight‑tampering (minimise L1 shift on final layer)
-#    --mono             : advisory‑monotonicity check
-#
-#  ------------------------------------------------------------------------
-#  COMMON OPTIONAL FLAGS
-#  ------------------------------------------------------------------------
-#    --timeout  S       : wall‑clock budget in seconds (default 30)
-#
-#  ------------------------------------------------------------------------
-#  NOISE MODE FLAGS
-#  ------------------------------------------------------------------------
-#    --rho   R          : nominal rho        (m)
-#    --theta T          : nominal theta      (deg)
-#    --psi   P          : nominal psi        (deg)
-#    --v1    V1         : ownship speed      (m/s – may be negative)
-#    --v2    V2         : intruder speed     (m/s – may be negative)
-#    --eps      E       : starting epsilon   (default 0.10)
-#    --eps-step D       : grid step          (default 0.10)
-#    --eps-max  M       : ceiling            (default 2.0)
-#
-#  Output (noise mode)
-#    • Per‑grid‑point line:  eps=E  (un)sat/unknown  time
-#    • On first SAT:        "First flip: AAA -> BBB at eps = EF"
-#    • Final CSV line       appended to robustness_log.csv
-#
-#  ------------------------------------------------------------------------
-#  ZONES MODE FLAGS
-#  ------------------------------------------------------------------------
-#    --block   R        : axis‑aligned blocker radius (default 0.10)
-#    --limit   N        : max witnesses per zone (omit = unlimited)
-#    --timeout S        : budget per zone in seconds (default 30)
-#    --first-only       : stop a zone after first witness
-#
-#  Output (zones mode)
-#    • One "FAIL:" line per counter‑example (rho,theta,psi,v1,v2)
-#    • Aligned ASCII summary table for all 5 zones
-#    • zones_stats_<dtype>.csv written with the same data
-#
-#  ------------------------------------------------------------------------
-#  QUICK EXAMPLES
-#  ------------------------------------------------------------------------
-#    1) 10‑second zone scan:
-#         python3 z3_verify_pfan.py posit16 --zones --timeout 10
-#
-#    2) Deeper scan (block 50 m, 100‑s budget):
-#         python3 z3_verify_pfan.py posit16 --zones --block 50 --timeout 100
-#
-#    3) Local robustness sweep around a Zone‑3 encounter:
-#         python3 z3_verify_pfan.py posit16 --rho 1000 --theta 90 --psi 60 \
-#                  --v1 0 --v2 0 --eps 1.0 --eps-step 1.0 --eps-max 50
-#
-#  ------------------------------------------------------------------------
-#  DEPENDENCIES
-#  ------------------------------------------------------------------------
-#    Python 3.6+ , TensorFlow 1.x CPU,  z3‑solver 4.8+,  NumPy ≥ 1.16
+#  Ctrl‑C ends immediately; timings use the style:
+#      (eps time=0.123s, total=4.7s)
+#  All identifiers, headers, and printed text are ASCII only
+#  (no Greek letters or Unicode symbols), to avoid UnicodeEncodeError.
 # =========================================================================
+
 import signal
 import sys
 import argparse
@@ -494,47 +422,50 @@ if mode == "noise":
         csv.writer(f).writerow(csv_row_str)
     sys.exit(0)
 
-# =========================================================================
-# 7) WEIGHT TAMPERING
-# =========================================================================
-if mode == "weights":
+# ------------------------------------------------------------------
+# 7) WEIGHT‑TAMPERING
+# ------------------------------------------------------------------
+if mode == 'weights':
     X0 = [args.rho, args.theta, args.psi, args.v1, args.v2]
-    hid = np.maximum(0, np.dot(X0, W1) + b1)
-    L1 = z3.Real("L1")
-    opt = z3.Optimize()
-    opt.set("timeout", int(args.timeout * 1000))
 
-    abs_terms, nW = [], {}
+    hid_num  = np.maximum(0, np.dot(X0, W1) + b1)
+    logits_0 = np.dot(hid_num, W2) + b2
+    adv_orig = int(np.argmax(logits_0))
+
+    hid = hid_num                     # reused below
+
+    L1  = z3.Real('L1')
+    opt = z3.Optimize()
+    opt.set('timeout', int(args.timeout * 1000))
+
+    abs_terms, newW = [], {}
     for i in range(16):
         for k in range(5):
-            v = z3.Real(f"w{i}_{k}")
-            nW[(i, k)] = v
-            a = z3.Real(f"a{i}_{k}")
-            opt.add(a >= v - float(W2[i, k]), a >= float(W2[i, k]) - v)
+            v = z3.Real('w_%d_%d' % (i, k)); newW[(i, k)] = v
+            a = z3.Real('a_%d_%d' % (i, k))
+            opt.add(a >= v - float(W2[i, k]),
+                    a >= float(W2[i, k]) - v)
             abs_terms.append(a)
     opt.add(L1 == sum(abs_terms))
 
-    log = [
-        b2[k] + sum(nW[(i, k)] * hid[i] for i in range(16)) for k in range(5)
-    ]
-    alt = z3.Int("alt")
-    opt.add(z3.And(alt >= 0, alt <= 4, alt != int(np.argmax(log))))
+    log = [b2[k] + sum(newW[(i, k)] * hid[i] for i in range(16))
+           for k in range(5)]
+
+    alt = z3.Int('alt')
+    opt.add(z3.And(alt >= 0, alt <= 4, alt != adv_orig))
     for k in range(5):
-        opt.add(
-            z3.Implies(
-                alt == k, z3.And(*[log[k] > log[j] for j in range(5) if j != k])
-            )
-        )
+        opt.add(z3.Implies(alt == k,
+                           z3.And(*[log[k] > log[j] for j in range(5) if j != k])))
+
     opt.minimize(L1)
 
-    t0 = time.perf_counter()
+    print('\nMinimising L1 ...')
+    t0 = time.perf_counter()            # start wall‑clock
     res = opt.check()
-    eps_time = time.perf_counter() - t0
-    total_time = time.perf_counter() - script_start
-    print("\nMinimising L1 ...")
-    print("Z3 %-7s  (eps time=%.3fs, total=%.1fs)" % (str(res), eps_time, total_time))
+    elapsed = time.perf_counter() - t0  # wall‑clock seconds
+    print('Z3:', res, '  wall time = %.2fs' % elapsed)
     if res == z3.sat:
-        print("L1* =", z3f(opt.model()[L1]))
+        print('L1* =', z3f(opt.model()[L1]))
     sys.exit(0)
 
 # =========================================================================
