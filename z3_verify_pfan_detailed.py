@@ -1,11 +1,120 @@
 #!/usr/bin/env python3
 # =========================================================================
-#  PFAN-1 VERIFICATION SCRIPT (ASCII only)
+# =========================================================================
+#  PFAN‑1 FORMAL‑VERIFICATION DRIVER
 #  ------------------------------------------------------------------------
-#  Ctrl‑C ends immediately; timings use the style:
-#      (eps time=0.123s, total=4.7s)
-#  All identifiers, headers, and printed text are ASCII only
-#  (no Greek letters or Unicode symbols), to avoid UnicodeEncodeError.
+#  Author      : Suleiman Sadiq      ·  April 2025 demo version
+#  File name   : z3_verify_pfan.py
+#  Purpose     : Symbolic, SMT‑based checks of the 5‑16‑5 “PFAN‑1” network
+#                that mimics ACAS advisories.  Three independent analysis
+#                families are offered:
+#
+#                  (1) ε‑grid input‑noise robustness        [default mode]
+#                  (2) Per‑zone counter‑example search      (--zones)
+#                  (3) Final‑layer weight tampering attack  (--weights)
+#                  (4) Advisory‑rank monotonicity check     (--mono)
+#
+#  All output is **ASCII only** – no Unicode symbols – so the script runs
+#  cleanly inside plain POSIX terminals and ancient log collectors.
+#
+#  ------------------------------------------------------------------------
+#  NUMERIC PRECISIONS / CHECKPOINTS
+#  ------------------------------------------------------------------------
+#    dtype argument   Checkpoint expected in cwd
+#    --------------   -----------------------------------
+#      posit32   ---> posit32_pfan.ckpt
+#      posit16   ---> posit16_pfan.ckpt
+#      posit8    ---> posit8_pfan.ckpt
+#      float32   ---> float32_pfan.ckpt
+#      float16   ---> float16_pfan.ckpt
+#
+#  ------------------------------------------------------------------------
+#  GLOBAL FLAGS (available in every mode)
+#  ------------------------------------------------------------------------
+#    --timeout S     Wall‑clock budget in seconds (default 30)
+#    --rho, --theta, --psi, --v1, --v2
+#                    Set a single encounter state for noise / weights /
+#                    mono modes.  Defaults = Zone‑2–ish point.
+#
+#  ------------------------------------------------------------------------
+#  MODE‑SPECIFIC FLAGS
+#  ------------------------------------------------------------------------
+#  (A) ε‑GRID INPUT‑NOISE ROBUSTNESS  [default]
+#      --eps E        Starting ε     (default 0.10)
+#      --eps-step D   Grid step      (default 0.10)
+#      --eps-max M    Maximum ε      (default 2.0)
+#
+#      Output: one line per ε plus a CSV summary in "robustness_log.csv".
+#
+#  (B) --zones   (per‑zone counter‑examples)
+#      --block R       Axis‑aligned blocker radius for locality pruning
+#                      (default 0.10).  Large R = deeper search.
+#      --limit N       Max witnesses stored per zone   (omit = unlimited)
+#      --first-only    Stop each zone after *one* witness is found.
+#
+#      Output: FAIL lines + aligned table + "zones_stats_<dtype>.csv".
+#
+#  (C) --weights (symbolic weight tampering – final layer only)
+#      Finds minimal L1 shift on W2 that flips the advisory at a fixed x₀.
+#      CSV lines appended to "weights_attack_log.csv".
+#
+#  (D) --mono    (monotonicity wrt decreasing range / tightening bearing)
+#      --rho-drop D    Upper bound on |ρ₂ – ρ₁| (default 500 m)
+#
+#      CSV lines appended to "mono_log.csv".
+#
+#  ------------------------------------------------------------------------
+#  QUICK EXAMPLE COMMANDS
+#  ------------------------------------------------------------------------
+#    # 1.  10‑s zone scan on posit‑16
+#    python3 z3_verify_pfan.py posit16 --zones --timeout 10
+#
+#    # 2.  Deeper per‑zone search (block 50 m, 100 s budget)
+#    python3 z3_verify_pfan.py posit16 --zones --block 50 --timeout 100
+#
+#    # 3.  Local robustness sweep around a Zone‑3 encounter
+#    python3 z3_verify_pfan.py posit16 --rho 1000 --theta 90 --psi 60 \
+#             --v1 0 --v2 0 --eps 1.0 --eps-step 1.0 --eps-max 50
+#
+#    # 4.  Weight‑tampering at Zone‑0 centre (posit‑8, 30‑s timeout)
+#    python3 z3_verify_pfan.py posit8 --weights --rho 6000 --theta 0 \
+#             --psi 0 --v1 250 --v2 250 --timeout 30
+#
+#    # 5.  Monotonicity violation search with 300 m rho drop cap
+#    python3 z3_verify_pfan.py posit32 --mono --rho-drop 300 \
+#             --rho 1000 --theta 90 --psi 30 --v1 120 --v2 120
+#
+#  ------------------------------------------------------------------------
+#  PARALLEL EXECUTION HINTS
+#  ------------------------------------------------------------------------
+#  • Each invocation is single‑threaded (pure Z3 + NumPy + TF‑CPU).
+#  • To scan all 5 zones for three dtypes on a 20‑core server:
+#
+#      for d in posit8 posit16 posit32; do
+#        python3 z3_verify_pfan.py "$d" --zones --block 50 --timeout 1800 &
+#      done
+#      wait
+#
+#  ------------------------------------------------------------------------
+#  RUNTIME DISPLAY CONVENTIONS
+#  ------------------------------------------------------------------------
+#      MONO sat   (wall 0.052s)
+#        rho  1000 -> 902
+#        psi   30.0 -> -30.0
+#        adv  StrongRight -> WeakRight
+#
+#      FAIL: WeakLeft at rho=152.3 theta=-89.8 psi=61.2 v1=0.0 v2=120.0
+#
+#      eps=0.30  unsat   (eps time=0.49s, total=3.6s)
+#
+#  ------------------------------------------------------------------------
+#  DEPENDENCIES
+#  ------------------------------------------------------------------------
+#      • Python 3.6+          • z3‑solver >= 4.8
+#      • TensorFlow 1.x CPU   • NumPy >= 1.16
+#
+#  The script calls tf.reset_default_graph(); it is therefore **not**
+#  compatible with eager execution in TF 2.x.
 # =========================================================================
 
 import signal
